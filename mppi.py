@@ -11,8 +11,6 @@ import jax.numpy as jnp
 
 from colorednoise import colored_noise
 
-__all__ = ["mppi_step"]
-
 
 @functools.partial(
     jax.jit,
@@ -114,13 +112,21 @@ def mppi_step(
     weighted_noise = jnp.sum(weights[:, None, None] * noise, axis=0)
     updated_trajectory = nominal_trajectory + weighted_noise
 
-    top_state_trajectories, top_action_trajectories, top_costs = get_top_k_trajectories(
-        current_state,
-        perturbed_trajectories,
-        costs,
-        dynamics_fn,
-        top_k,
-    )
+    # Collect top-k best trajectories for debugging / visualization
+    _, top_indices = jax.lax.top_k(-costs, top_k)
+    top_action_trajectories = perturbed_trajectories[top_indices]
+
+    def rollout_states(control_sequence):
+        def step(carry_state, action):
+            next_state = dynamics_fn(carry_state, action)
+            return next_state, next_state
+
+        _, state_history = jax.lax.scan(step, current_state, control_sequence)
+        return state_history
+
+    top_state_trajectories = jax.vmap(rollout_states)(top_action_trajectories)
+    top_costs = costs[top_indices]
+
     return updated_trajectory, (
         top_state_trajectories,
         top_action_trajectories,
@@ -128,26 +134,7 @@ def mppi_step(
     )
 
 
-def get_top_k_trajectories(
-    current_state: Any,
-    perturbed_trajectories: jax.Array,
-    costs: jax.Array,
-    dynamics_fn: Callable[[Any, jax.Array], Any],
-    top_k: int,
-) -> Tuple[jax.Array, jax.Array, jax.Array]:
-    _, top_indices = jax.lax.top_k(-costs, top_k)
-    top_action_trajectories = perturbed_trajectories[top_indices]
 
-    def rollout_states(control_sequence):
-        def step(carry_state, action):
-            next_state = dynamics_fn(carry_state, action)
-            return next_state, next_state  # return state as the output
-
-        _, state_history = jax.lax.scan(step, current_state, control_sequence)
-        return state_history
-
-    top_state_trajectories = jax.vmap(rollout_states)(top_action_trajectories)
-    return top_state_trajectories, top_action_trajectories, costs[top_indices]
 
 
 if __name__ == "__main__":
