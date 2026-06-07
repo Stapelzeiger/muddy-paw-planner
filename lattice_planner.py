@@ -47,7 +47,9 @@ class Lattice:
         state_indices = jnp.arange(num_states)
 
         def get_next_states(state_idx):
-            dims = map_dim + (np.prod(np.array(lattice_def.state_dim_per_pos)),)
+            dims = map_dim + (
+                np.prod(np.array(lattice_def.state_dim_per_pos, dtype=np.int32)),
+            )
             posy, posx, non_pos_idx = jnp.unravel_index(state_idx, dims)
             rel_pos = lattice_def.neighbor_rel_pos[non_pos_idx]
             new_non_pos_idx = lattice_def.neighbor_non_pos_state_idx[non_pos_idx]
@@ -83,6 +85,7 @@ class Lattice:
         state_indices = jnp.arange(num_states)
 
         def compute_costs_idx(idx: jax.Array) -> jax.Array:
+            """idx shape (), returns cost shape (num_neighbors,)"""
             pos, non_pos_state = self.index_to_state(idx)
             return self.lattice_definition.cost_fn(pos, non_pos_state, gridmap)
 
@@ -104,12 +107,24 @@ class Lattice:
     def index_to_state(self, index: jax.Array) -> Tuple[jax.Array, jax.Array]:
         dims = self.map_dim + self.lattice_definition.state_dim_per_pos
         posy, posx, *non_pos_state = jnp.unravel_index(index, dims)
-        return jnp.stack([posx, posy], axis=-1), jnp.stack(non_pos_state, axis=-1)
+        if non_pos_state:
+            non_pos_stacked = jnp.stack(non_pos_state, axis=-1)
+        else:
+            batch_shape = index.shape[:-1] if index.ndim > 0 else ()
+            non_pos_stacked = jnp.empty(batch_shape + (0,), dtype=index.dtype)
+        return jnp.stack([posx, posy], axis=-1), non_pos_stacked
 
 
 def build_extension() -> None:
     result = subprocess.run(
-        ["g++", "-shared", "-o", "lattice_dijkstra.so", "-fPIC", "lattice_dijkstra.cpp"],
+        [
+            "g++",
+            "-shared",
+            "-o",
+            "lattice_dijkstra.so",
+            "-fPIC",
+            "lattice_dijkstra.cpp",
+        ],
         capture_output=True,
         text=True,
     )
@@ -204,6 +219,35 @@ def plan(
         layers={"cost_to_go": jnp.asarray(cost_to_go).reshape(ctg_shape)},
     )
     return cost_to_go_map
+
+
+def make_grid_2d_8conn_lattice(cost_layer="traversability"):
+    neighbor_pos = jnp.array(
+        [
+            [1, 0],
+            [1, 1],
+            [0, 1],
+            [-1, 1],
+            [-1, 0],
+            [-1, -1],
+            [0, -1],
+            [1, -1],
+        ],
+        dtype=jnp.int32,
+    ).reshape((1, 8, 2))
+    neighbor_dist = jnp.linalg.norm(neighbor_pos[0].astype(jnp.float32), axis=1)
+
+    def cost_fn(pos, non_pos, gm):
+        query_pos = pos[None, :] + neighbor_pos[0]  # query is shape(8, 2)
+        cost = gm.layers[cost_layer][query_pos[:, 1], query_pos[:, 0]]
+        return cost * neighbor_dist * gm.resolution
+
+    return LatticeDefinition(
+        state_dim_per_pos=(),  # no non-positional state
+        cost_fn=cost_fn,
+        neighbor_non_pos_state_idx=jnp.zeros((1, 8), dtype=jnp.int32),
+        neighbor_rel_pos=neighbor_pos,
+    )
 
 
 # --------------------------------------------------
@@ -334,3 +378,135 @@ assert ctg_map.resolution == 1.0
 print("plan() OK!")
 
 print("All tests passed!")
+
+# ----------------- Test 8-connected lattice -----------------
+print("\n--- Testing 8-connected lattice ---")
+
+lat_8conn = make_grid_2d_8conn_lattice(cost_layer="traversability")
+lattice_8conn = Lattice.create(lat_8conn, (10, 12))
+
+gm_8conn = gridmap.GridMap(
+    origin=jnp.array([0.0, 0.0]),
+    resolution=1.0,
+    layers={"traversability": jnp.ones((10, 12), dtype=jnp.float32)},
+)
+
+initial_states_8conn = np.array([[2, 2]], dtype=np.int32)
+initial_costs_8conn = np.array([0.0], dtype=np.float32)
+terminal_state_8conn = np.array([7, 7], dtype=np.int32)
+
+ctg_map_8conn = plan(
+    lattice_8conn,
+    gm_8conn,
+    initial_states_8conn,
+    initial_costs_8conn,
+    terminal_state_8conn,
+)
+# ----------------- Bug trap test with visualization -----------------
+print("\n--- Testing bug trap escape ---")
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ASCII map: #=obstacle, ' '=free, s=start, g=goal
+bugtrap_ascii = r"""
+###########
+#         #
+#  #      #
+#  #   #  #
+#  # s #  #
+#  #####  #
+#         #
+#    g    #
+###########
+"""
+rows = bugtrap_ascii.strip().split("\n")
+H, W = len(rows), len(rows[0])
+print(f"Bug trap map: {H}x{W}")
+
+trav = jnp.ones((H, W), dtype=jnp.float32)
+start_pos = None  # (row, col) of 's'
+goal_pos = None  # (row, col) of 'g'
+for r in range(H):
+    for c in range(W):
+        ch = rows[r][c]
+        if ch == "#":
+            trav = trav.at[r, c].set(jnp.inf)
+        elif ch == "s":
+            start_pos = (r, c)
+        elif ch == "g":
+            goal_pos = (r, c)
+
+print(
+    f"Start (s) at row={start_pos[0]}, col={start_pos[1]}  -> [x={start_pos[1]}, y={start_pos[0]}]"
+)
+print(
+    f"Goal  (g) at row={goal_pos[0]}, col={goal_pos[1]}  -> [x={goal_pos[1]}, y={goal_pos[0]}]"
+)
+
+# pos is [x, y] = [col, row]
+# Agent starts at 'g', needs to reach 's'
+init_st = np.array([[goal_pos[1], goal_pos[0]]], dtype=np.int32)
+term_st = np.array([start_pos[1], start_pos[0]], dtype=np.int32)
+init_cost = np.array([0.0], dtype=np.float32)
+
+gm_trap = gridmap.GridMap(
+    origin=jnp.array([0.0, 0.0]),
+    resolution=1.0,
+    layers={"traversability": trav},
+)
+
+# Build lattice for this map size
+lattice_trap = Lattice.create(lat_8conn, (H, W))
+
+ctg = plan(lattice_trap, gm_trap, init_st, init_cost, term_st)
+ctg_layer = np.array(ctg.layers["cost_to_go"])
+print(f"Bug trap cost_to_go shape: {ctg_layer.shape}")
+print(f"Cost at start (s): {ctg_layer[start_pos[0], start_pos[1]]}")
+print(f"Cost at goal (g): {ctg_layer[goal_pos[0], goal_pos[1]]}")
+
+# Plot
+fig, ax = plt.subplots(figsize=(8, 6))
+obs = np.isinf(trav).astype(float)
+# Mask obstacles with NaN so the colormap doesn't show them
+masked_ctg = np.where(obs > 0, np.nan, ctg_layer)
+# Clamp color range to [0, max] so the gradient is vivid
+max_cost = float(np.nanmax(masked_ctg))
+# Use black axis background; NaN cells show through as black (obstacles)
+ax.set_facecolor("black")
+im = ax.imshow(masked_ctg, cmap="viridis", origin="upper", vmin=0, vmax=max_cost)
+cbar = plt.colorbar(im, ax=ax)
+cbar.set_label("Cost-to-go")
+# Robot is at 's' (start), wants to reach 'g' (goal)
+# We plan in reverse from goal -> start to build cost-to-go
+sx, sy = start_pos[1], start_pos[0]  # robot start position
+gx, gy = goal_pos[1], goal_pos[0]  # robot goal position
+ax.plot(
+    sx,
+    sy,
+    "go",
+    markersize=14,
+    label=f"Start (s) cost={ctg_layer[start_pos[0], start_pos[1]]:.0f}",
+    zorder=5,
+)
+ax.plot(
+    gx,
+    gy,
+    "r*",
+    markersize=16,
+    label=f"Goal (g) cost={ctg_layer[goal_pos[0], goal_pos[1]]:.0f}",
+    zorder=5,
+)
+ax.set_title(
+    "Bug Trap: Cost-to-Go\n(robot starts at s, plans to g, cost computed in reverse)"
+)
+ax.legend()
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+fig.savefig("bugtrap_ctg.png", dpi=150, bbox_inches="tight")
+print("Saved bugtrap_ctg.png")
+plt.close(fig)
+
+print("Bug trap test done!")
