@@ -48,7 +48,7 @@ class Lattice:
 
         def get_next_states(state_idx):
             dims = map_dim + (
-                np.prod(np.array(lattice_def.state_dim_per_pos, dtype=np.int32)),
+                np.prod(np.array(lattice_def.state_dim_per_pos)).astype(jnp.int32),
             )
             posy, posx, non_pos_idx = jnp.unravel_index(state_idx, dims)
             rel_pos = lattice_def.neighbor_rel_pos[non_pos_idx]
@@ -61,6 +61,11 @@ class Lattice:
                 )
 
             next_indices = jax.vmap(pos_non_pos_idx_to_index)(new_pos, new_non_pos_idx)
+            max_idx = jnp.array([map_dim[1], map_dim[0]])
+            out_of_bounds = jnp.any(new_pos < 0) | jnp.any(new_pos >= max_idx)
+            next_indices = jnp.where(
+                out_of_bounds, jnp.full_like(next_indices, state_idx), next_indices
+            )
             return next_indices
 
         return jax.vmap(get_next_states)(state_indices)
