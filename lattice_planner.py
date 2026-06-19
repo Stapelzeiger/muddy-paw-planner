@@ -28,13 +28,6 @@ class LatticeDefinition:
     # shape: (num_states_per_pos, num_neighbors, 2) [rel x, rel y]
     neighbor_rel_pos: jax.Array
 
-    # TODO might delete this
-    def non_pos_state_to_index(self, non_pos_state: jax.Array) -> jax.Array:
-        non_pos_tuple = tuple(
-            non_pos_state[..., i] for i in range(len(self.state_dim_per_pos))
-        )
-        return jnp.ravel_multi_index(non_pos_tuple, self.state_dim_per_pos)
-
 
 @partial(
     jax.tree_util.register_dataclass,
@@ -320,25 +313,6 @@ if __name__ == "__main__":
             self.assertTrue(jnp.array_equal(r_pos, pos))
             self.assertTrue(jnp.array_equal(r_nps, non_pos))
 
-    class TestNonPosStateToIndex(unittest.TestCase):
-        @classmethod
-        def setUpClass(cls):
-            cls.lat_def = LatticeDefinition(
-                state_dim_per_pos=(3, 4),
-                cost_fn=dummy_cost_fn,
-                neighbor_non_pos_state_idx=jnp.zeros((12, 2), dtype=jnp.int32),
-                neighbor_rel_pos=jnp.zeros((12, 2, 2), dtype=jnp.int32),
-            )
-
-        def test_single(self):
-            self.assertEqual(self.lat_def.non_pos_state_to_index(jnp.array([1, 2])), 6)
-
-        def test_batched(self):
-            result = self.lat_def.non_pos_state_to_index(
-                jnp.array([[1, 2], [0, 3], [2, 1]])
-            )
-            self.assertTrue(jnp.array_equal(result, jnp.array([6, 3, 9])))
-
     class TestLatticeShape(unittest.TestCase):
         @classmethod
         def setUpClass(cls):
@@ -421,18 +395,17 @@ if __name__ == "__main__":
             except ImportError:
                 self.skipTest("matplotlib not installed")
 
-            bugtrap_ascii = r"""
-###########
-#         #
-#  #      #
-#  #   #  #
-#  # s #  #
-#  #####  #
-#         #
-#    g    #
-###########
-"""
-            rows = bugtrap_ascii.strip().split("\n")
+            rows = [
+                "###########",
+                "#         #",
+                "#  #      #",
+                "#  #   #  #",
+                "#  # s #  #",
+                "#  #####  #",
+                "#         #",
+                "#    g    #",
+                "###########",
+            ]
             H, W = len(rows), len(rows[0])
 
             trav = jnp.ones((H, W), dtype=jnp.float32)
