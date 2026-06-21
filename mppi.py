@@ -17,6 +17,7 @@ from colorednoise import colored_noise
     static_argnames=(
         "dynamics_fn",
         "cost_fn",
+        "terminal_cost_fn",
         "noise_freq_exponent",
         "integrate_noise",
         "top_k",
@@ -29,6 +30,7 @@ def mppi_step(
     goal_context: Any,
     dynamics_fn: Callable[[Any, jax.Array], Any],
     cost_fn: Callable,
+    terminal_cost_fn: Callable,
     noise_std: jax.Array = jnp.array([0.5]),
     noise_freq_exponent: float = 0.0,
     integrate_noise: bool = False,
@@ -51,6 +53,7 @@ def mppi_step(
         goal_context: User-defined context (e.g. goal) passed through to ``cost_fn``.
         dynamics_fn: ``(state, action) -> next_state``.
         cost_fn: Stateful per-step cost; see above.
+        terminal_cost_fn: Terminal cost function; ``(cost_state, dyn_state, goal_context) -> terminal_cost``.
         noise_std: Per-action noise scale, broadcast over ``action_dim``.
         noise_freq_exponent: Power-law exponent β for coloured noise (0 = white).
             β=1 pink, β=2 brown/red, higher β = smoother perturbations.
@@ -98,8 +101,9 @@ def mppi_step(
         time_indices = jnp.arange(horizon)
         inputs = (time_indices, control_sequence)
         init_carry = (current_state, initial_cost_state)
-        _, step_costs = jax.lax.scan(step, init_carry, inputs)
-        return jnp.sum(step_costs)
+        (final_state, cost_state), step_costs = jax.lax.scan(step, init_carry, inputs)
+        terminal_cost = terminal_cost_fn(cost_state, final_state, goal_context)
+        return jnp.sum(step_costs) + terminal_cost
 
     rollout_all = jax.vmap(rollout_single_trajectory)
     costs = rollout_all(perturbed_trajectories)
@@ -132,9 +136,6 @@ def mppi_step(
         top_action_trajectories,
         top_costs,
     )
-
-
-
 
 
 if __name__ == "__main__":
@@ -189,6 +190,9 @@ if __name__ == "__main__":
 
     cost_fn = unicycle_cost_fn()
 
+    def terminal_cost_fn(final_cost_state, final_state, goal_context):
+        return 0.0
+
     state_history = [np.array(state)]
     control_history = []
     # Snapshots: (step, top_state_trajs, opt_path, cur_state)
@@ -212,6 +216,7 @@ if __name__ == "__main__":
             target,
             unicycle_dynamics,
             cost_fn,
+            terminal_cost_fn,
             top_k=30,
         )
         u = nominal_traj[0]
