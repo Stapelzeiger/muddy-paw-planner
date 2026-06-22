@@ -128,9 +128,6 @@ def load_lattice_dijkstra() -> ctypes.CDLL:
     cpp_source = current_dir / "lattice_dijkstra.cpp"
     binary_target = current_dir / "lattice_dijkstra.so"
 
-    if not cpp_source.exists():
-        raise FileNotFoundError(f"Missing source file: {cpp_source}")
-
     if (
         not binary_target.exists()
         or cpp_source.stat().st_mtime > binary_target.stat().st_mtime
