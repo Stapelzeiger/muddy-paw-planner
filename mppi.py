@@ -21,6 +21,7 @@ from colorednoise import colored_noise
         "noise_freq_exponent",
         "integrate_noise",
         "top_k",
+        "num_samples",
     ),
 )
 def mppi_step(
@@ -31,6 +32,7 @@ def mppi_step(
     dynamics_fn: Callable[[Any, jax.Array], Any],
     cost_fn: Callable,
     terminal_cost_fn: Callable,
+    initial_cost_state: Any = None,
     noise_std: jax.Array = jnp.array([0.5]),
     noise_freq_exponent: float = 0.0,
     integrate_noise: bool = False,
@@ -43,8 +45,9 @@ def mppi_step(
     Draws ``num_samples`` Gaussian perturbations around ``nominal_trajectory``, rolls each
     sequence forward with ``dynamics_fn``, and sums per-step costs from ``cost_fn``.
 
-    The cost function can be stateful with initial cost state provided by ``cost_fn.initial_cost_state``.
-    ``cost_fn(cost_state, dyn_state, action, goal_context, i, horizon) -> (next_cost_state, step_cost)``.
+    Cost state ``initial_cost_state`` is passed through ``cost_fn`` and ``terminal_cost_fn``.
+    ``cost_fn(cost_state, dyn_state, action, goal_context) -> (next_cost_state, step_cost)``
+    ``terminal_cost_fn(cost_state, dyn_state, goal_context) -> terminal_cost``
 
     Args:
         key: JAX PRNG key for sampling noise.
@@ -53,7 +56,8 @@ def mppi_step(
         goal_context: User-defined context (e.g. goal) passed through to ``cost_fn``.
         dynamics_fn: ``(state, action) -> next_state``.
         cost_fn: Stateful per-step cost; see above.
-        terminal_cost_fn: Terminal cost function; ``(cost_state, dyn_state, goal_context) -> terminal_cost``.
+        terminal_cost_fn: Terminal cost function; see above.
+        initial_cost_state: Initial cost state passed through ``cost_fn``.
         noise_std: Per-action noise scale, broadcast over ``action_dim``.
         noise_freq_exponent: Power-law exponent β for coloured noise (0 = white).
             β=1 pink, β=2 brown/red, higher β = smoother perturbations.
@@ -86,22 +90,20 @@ def mppi_step(
         noise = jnp.cumsum(noise, axis=1)
 
     perturbed_trajectories = nominal_trajectory + noise
-    initial_cost_state = getattr(cost_fn, "initial_cost_state", None)
 
     def rollout_single_trajectory(control_sequence):
-        def step(carry, idx_action):
+        def step(carry, action):
             dyn_state, cost_state = carry
-            i, current_action = idx_action
-            next_dyn_state = dynamics_fn(dyn_state, current_action)
+            next_dyn_state = dynamics_fn(dyn_state, action)
             next_cost_state, step_cost = cost_fn(
-                cost_state, next_dyn_state, current_action, goal_context, i, horizon
+                cost_state, next_dyn_state, action, goal_context
             )
             return (next_dyn_state, next_cost_state), step_cost
 
-        time_indices = jnp.arange(horizon)
-        inputs = (time_indices, control_sequence)
         init_carry = (current_state, initial_cost_state)
-        (final_state, cost_state), step_costs = jax.lax.scan(step, init_carry, inputs)
+        (final_state, cost_state), step_costs = jax.lax.scan(
+            step, init_carry, control_sequence
+        )
         terminal_cost = terminal_cost_fn(cost_state, final_state, goal_context)
         return jnp.sum(step_costs) + terminal_cost
 
@@ -160,22 +162,15 @@ if __name__ == "__main__":
 
         return jnp.array([next_x, next_y, next_theta])
 
-    class unicycle_cost_fn:
-        def __init__(self):
-            self.initial_cost_state = None
+    def unicycle_cost_fn(cost_state, state, action, goal_context):
+        pos_error = jnp.sum((state[:2] - goal_context[:2]) ** 2)
+        theta_error = (state[2] - goal_context[2]) ** 2
+        control_cost = 0.01 * jnp.sum(action**2)
+        step_cost = pos_error + 0.1 * theta_error + control_cost
+        return cost_state, step_cost
 
-        def __call__(self, cost_state, state, action, goal_context, i, N):
-            """
-            Stateful per-step cost: (cost_state, step_cost).
-
-            cost_state is carried across the horizon; this default ignores it.
-            i is the step index in [0, N). N is the horizon length.
-            """
-            pos_error = jnp.sum((state[:2] - goal_context[:2]) ** 2)
-            theta_error = (state[2] - goal_context[2]) ** 2
-            control_cost = 0.01 * jnp.sum(action**2)
-            step_cost = pos_error + 0.1 * theta_error + control_cost
-            return cost_state, step_cost
+    def unicycle_terminal_cost_fn(final_cost_state, final_state, goal_context):
+        return 0.0
 
     rng = jax.random.PRNGKey(42)
     state = jnp.array([0.0, 0.0, 0.0])  # Start at origin, facing right
@@ -187,11 +182,6 @@ if __name__ == "__main__":
 
     print(f"Initial State: {state}")
     print(f"Target State:  {target}\n")
-
-    cost_fn = unicycle_cost_fn()
-
-    def terminal_cost_fn(final_cost_state, final_state, goal_context):
-        return 0.0
 
     state_history = [np.array(state)]
     control_history = []
@@ -215,8 +205,8 @@ if __name__ == "__main__":
             nominal_traj,
             target,
             unicycle_dynamics,
-            cost_fn,
-            terminal_cost_fn,
+            unicycle_cost_fn,
+            unicycle_terminal_cost_fn,
             top_k=30,
         )
         u = nominal_traj[0]
