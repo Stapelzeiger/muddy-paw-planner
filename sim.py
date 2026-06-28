@@ -7,19 +7,10 @@ import mujoco.viewer
 import numpy as np
 from mujoco import mjx
 
-xml_string = """
+ball_model = """
 <mujoco>
-    <asset>
-        <texture name="checkerboard" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .15 .2"
-                 width="512" height="512" mark="none"/>
-        <material name="background_mat" texture="checkerboard" texrepeat="10 10"/>
-    </asset>
-
     <worldbody>
         <light pos="0 0 10" dir="0 0 -1" directional="true"/>
-
-        <geom name="background_floor" type="plane" size="50 50 .1" pos="0 0 -10"
-              material="background_mat" contype="0" conaffinity="0"/>
 
         <body name="ball" pos="0 0 3">
             <joint name="ball_free" type="free"/>
@@ -58,10 +49,34 @@ def add_hfield(spec, name, nrow, ncol, size, initial_data):
     return body
 
 
+def add_checkerboard(spec, extent, z):
+    """Add a visualization-only checkerboard plane spanning the full map, below the terrain."""
+    tex = spec.add_texture(name="checkerboard")
+    tex.type = mujoco.mjtTexture.mjTEXTURE_2D
+    tex.builtin = mujoco.mjtBuiltin.mjBUILTIN_CHECKER
+    tex.rgb1 = [0.2, 0.3, 0.4]
+    tex.rgb2 = [0.1, 0.15, 0.2]
+    tex.width = 512
+    tex.height = 512
+    mat = spec.add_material(name="checkerboard_mat", texrepeat=[10, 10])
+    mat.textures[1] = "checkerboard"
+
+    spec.worldbody.add_geom(
+        name="checkerboard",
+        type=mujoco.mjtGeom.mjGEOM_PLANE,
+        size=[extent, extent, 0.1],
+        pos=[0, 0, z],
+        material="checkerboard_mat",
+        contype=0,
+        conaffinity=0,
+    )
+
+
 class Sim:
     def __init__(
         self,
         xml_string,
+        robot_body_name,
         dt=0.05,
         global_extent=50.0,
         global_res=0.1,
@@ -95,6 +110,7 @@ class Sim:
         size = [hx, hy, self.global_range, base]
 
         spec = mujoco.MjSpec.from_string(xml_string)
+        add_checkerboard(spec, extent=global_extent, z=self.global_min)
         add_hfield(
             spec,
             name="terrain",
@@ -110,8 +126,8 @@ class Sim:
         self.hfield_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_HFIELD, "terrain"
         )
-        self.ball_body_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_BODY, "ball"
+        self.robot_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, robot_body_name
         )
         self.floor_mocap_id = self.model.body_mocapid[
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "floor_body")
@@ -128,7 +144,7 @@ class Sim:
 
     def update_local_terrain(self):
         """Slice the global heightmap around the robot and sync it into data and mjx."""
-        robot_x, robot_y = self.data.xpos[self.ball_body_id][:2]
+        robot_x, robot_y = self.data.xpos[self.robot_body_id][:2]
         extent = self.global_extent
         res = self.global_res
 
@@ -206,9 +222,7 @@ class Sim:
 
 
 if __name__ == "__main__":
-    sim = Sim(xml_string)
-    horizon = int(0.5 / sim.dt)
-    body_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "ball")
+    sim = Sim(ball_model, robot_body_name="ball")
 
     @jax.jit
     def rollout(model, state, actions):
@@ -240,12 +254,13 @@ if __name__ == "__main__":
         while viewer.is_running() and (time.time() - start_time < 30.0):
             step_start = time.time()
 
+            horizon = int(0.5 / sim.dt)
             trajectory = rollout(
                 sim.get_mjx_model(),
                 sim.get_mjx_state(),
                 jnp.zeros((horizon, sim.model.nu)),
             )
-            positions = np.asarray(trajectory.xpos)[:, body_id]
+            positions = np.asarray(trajectory.xpos)[:, sim.robot_body_id]
             draw_trajectory(viewer, positions)
 
             sim.step(np.zeros(sim.model.nu))
