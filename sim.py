@@ -10,8 +10,6 @@ from mujoco import mjx
 xml_string = """
 <mujoco>
     <asset>
-        <hfield name="terrain" nrow="100" ncol="100" size="5 5 1.0 0.1"/>
-
         <texture name="checkerboard" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 .15 .2"
                  width="512" height="512" mark="none"/>
         <material name="background_mat" texture="checkerboard" texrepeat="10 10"/>
@@ -20,12 +18,8 @@ xml_string = """
     <worldbody>
         <light pos="0 0 10" dir="0 0 -1" directional="true"/>
 
-        <geom name="background_floor" type="plane" size="50 50 .1" pos="0 0 -0.05"
+        <geom name="background_floor" type="plane" size="50 50 .1" pos="0 0 -10"
               material="background_mat" contype="0" conaffinity="0"/>
-
-        <body name="floor_body" mocap="true" pos="0 0 0">
-            <geom name="floor" type="hfield" hfield="terrain" rgba="0.3 0.5 0.3 1"/>
-        </body>
 
         <body name="ball" pos="0 0 3">
             <joint name="ball_free" type="free"/>
@@ -41,9 +35,74 @@ xml_string = """
 """
 
 
+def elevation(x, y):
+    return np.cos(x) + np.sin(2 * y) + 0.1 * x - 100
+
+
+def add_hfield(spec, name, nrow, ncol, size, initial_data):
+    """Attach a height-field asset plus a mocap floor body/geom to the spec.
+
+    The floor body is mocap so the local terrain window can be repositioned and
+    re-sliced around the robot at runtime without going through the physics.
+    """
+    hfield = spec.add_hfield(name=name, nrow=nrow, ncol=ncol, size=size)
+    hfield.userdata = initial_data.flatten().astype(np.float32)
+
+    body = spec.worldbody.add_body(name="floor_body", mocap=True)
+    body.add_geom(
+        name="floor",
+        type=mujoco.mjtGeom.mjGEOM_HFIELD,
+        hfieldname=name,
+        rgba=[0.3, 0.5, 0.3, 1],
+    )
+    return body
+
+
 class Sim:
-    def __init__(self, xml_string, dt=0.05):
-        self.model = mujoco.MjModel.from_xml_string(xml_string)
+    def __init__(
+        self,
+        xml_string,
+        dt=0.05,
+        global_extent=50.0,
+        global_res=0.1,
+        hfield_nrow=101,
+        hfield_ncol=101,
+    ):
+        self.global_extent = global_extent
+        self.global_res = global_res
+        self.hfield_nrow = hfield_nrow
+        self.hfield_ncol = hfield_ncol
+
+        global_x = np.arange(-global_extent, global_extent, global_res)
+        global_y = np.arange(-global_extent, global_extent, global_res)
+        X, Y = np.meshgrid(global_x, global_y)
+        Z = elevation(X, Y)
+
+        # Metric heights shifted so the origin sits at z=0.
+        origin_idx = int(round(global_extent / global_res))
+        Z = Z - Z[origin_idx, origin_idx]
+        self.global_min = float(Z.min())
+        self.global_range = float(Z.max() - Z.min())
+        # Stored normalized to [0, 1] over the global range so a slice can be
+        # written straight into the hfield; max_height/geom-z recover metric z.
+        self.global_hmap = (Z - self.global_min) / self.global_range
+
+        # Hfield half-extents aligned to the global grid spacing.
+        hx = (hfield_ncol - 1) * global_res / 2
+        hy = (hfield_nrow - 1) * global_res / 2
+        base = 0.1
+        size = [hx, hy, self.global_range, base]
+
+        spec = mujoco.MjSpec.from_string(xml_string)
+        add_hfield(
+            spec,
+            name="terrain",
+            nrow=hfield_nrow,
+            ncol=hfield_ncol,
+            size=size,
+            initial_data=np.zeros(hfield_nrow * hfield_ncol),
+        )
+        self.model = spec.compile()
         self.data = mujoco.MjData(self.model)
         self.substeps = max(1, round(dt / self.model.opt.timestep))
 
@@ -56,20 +115,7 @@ class Sim:
         self.floor_mocap_id = self.model.body_mocapid[
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "floor_body")
         ]
-
         self.hfield_adr = self.model.hfield_adr[self.hfield_id]
-        self.hfield_nrow = self.model.hfield_nrow[self.hfield_id]
-        self.hfield_ncol = self.model.hfield_ncol[self.hfield_id]
-
-        self.global_extent = 50.0
-        self.global_res = 0.1
-        x_global = np.arange(-self.global_extent, self.global_extent, self.global_res)
-        y_global = np.arange(-self.global_extent, self.global_extent, self.global_res)
-        X, Y = np.meshgrid(x_global, y_global)
-        # Z = np.sin(X) * np.cos(Y) + 0.5 * np.sin(0.5 * X)
-        Z = X + np.sin(Y)
-        self.global_hmap = (Z - Z.min()) / (Z.max() - Z.min())
-        self.model.hfield_size[self.hfield_id] = [10.0, 10.0, Z.min(), Z.max()]
 
         self.mjx_model = mjx.put_model(self.model)
         self.update_local_terrain()
@@ -81,39 +127,47 @@ class Sim:
 
     def update_local_terrain(self):
         """Slice the global heightmap around the robot and sync it into data and mjx."""
-        robot_pos = self.data.xpos[self.ball_body_id][:2]
+        robot_x, robot_y = self.data.xpos[self.ball_body_id][:2]
+        extent = self.global_extent
+        res = self.global_res
 
-        center_idx_x = int(round((robot_pos[0] + self.global_extent) / self.global_res))
-        center_idx_y = int(round((robot_pos[1] + self.global_extent) / self.global_res))
-
-        half_row = self.hfield_nrow // 2
-        half_col = self.hfield_ncol // 2
-        start_x = max(
-            0,
-            min(center_idx_x - half_row, self.global_hmap.shape[0] - self.hfield_nrow),
+        ix_center = int(round((robot_x + extent) / res))
+        iy_center = int(round((robot_y + extent) / res))
+        half_nrow = self.hfield_nrow // 2
+        half_ncol = self.hfield_ncol // 2
+        start_iy = max(
+            0, min(iy_center - half_nrow, self.global_hmap.shape[0] - self.hfield_nrow)
         )
-        start_y = max(
-            0,
-            min(center_idx_y - half_col, self.global_hmap.shape[1] - self.hfield_ncol),
+        start_ix = max(
+            0, min(ix_center - half_ncol, self.global_hmap.shape[1] - self.hfield_ncol)
         )
 
         sub_hmap = self.global_hmap[
-            start_x : start_x + self.hfield_nrow, start_y : start_y + self.hfield_ncol
+            start_iy : start_iy + self.hfield_nrow,
+            start_ix : start_ix + self.hfield_ncol,
         ]
 
-        snapped_x = (start_x + half_row) * self.global_res - self.global_extent
-        snapped_y = (start_y + half_col) * self.global_res - self.global_extent
+        x_lo = -extent + start_ix * res
+        x_hi = -extent + (start_ix + self.hfield_ncol - 1) * res
+        y_lo = -extent + start_iy * res
+        y_hi = -extent + (start_iy + self.hfield_nrow - 1) * res
+        center_x = (x_lo + x_hi) / 2
+        center_y = (y_lo + y_hi) / 2
 
-        # 1. Update the heightmap matrix data array in the model
         n = self.hfield_nrow * self.hfield_ncol
         self.model.hfield_data[self.hfield_adr : self.hfield_adr + n] = (
             sub_hmap.flatten()
         )
 
-        # 2. Update the dynamic position of the terrain using mocap_pos
-        self.data.mocap_pos[self.floor_mocap_id, :2] = [snapped_x, snapped_y]
+        self.data.mocap_pos[self.floor_mocap_id] = [
+            center_x,
+            center_y,
+            self.global_min,
+        ]
+        # Refresh derived body poses so the rendered hfield position matches the
+        # updated data this frame (otherwise xpos lags mocap_pos by one step).
+        mujoco.mj_kinematics(self.model, self.data)
 
-        # 3. Synchronize both down to MJX structures
         self.mjx_model = self.mjx_model.replace(
             hfield_data=jnp.asarray(self.model.hfield_data),
         )
@@ -151,7 +205,7 @@ class Sim:
 
 
 if __name__ == "__main__":
-    sim = Sim(xml_string)
+    sim = Sim(xml_string, global_res=0.5)
     horizon = int(0.5 / sim.dt)
     body_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "ball")
 
@@ -194,8 +248,8 @@ if __name__ == "__main__":
             draw_trajectory(viewer, positions)
 
             sim.step(np.zeros(sim.model.nu))
-            viewer.update_hfield(sim.hfield_id)
             viewer.sync()
+            viewer.update_hfield(sim.hfield_id)
 
             time_until_next_step = sim.dt - (time.time() - step_start)
             if time_until_next_step > 0:
