@@ -70,8 +70,6 @@ class Sim:
     ):
         self.global_extent = global_extent
         self.global_res = global_res
-        self.hfield_nrow = hfield_nrow
-        self.hfield_ncol = hfield_ncol
 
         global_x = np.arange(-global_extent, global_extent, global_res)
         global_y = np.arange(-global_extent, global_extent, global_res)
@@ -87,9 +85,12 @@ class Sim:
         # written straight into the hfield; max_height/geom-z recover metric z.
         self.global_hmap = (Z - self.global_min) / self.global_range
 
+        # The local window cannot hold more samples than the global grid.
+        self.hfield_nrow = min(hfield_nrow, self.global_hmap.shape[0])
+        self.hfield_ncol = min(hfield_ncol, self.global_hmap.shape[1])
         # Hfield half-extents aligned to the global grid spacing.
-        hx = (hfield_ncol - 1) * global_res / 2
-        hy = (hfield_nrow - 1) * global_res / 2
+        hx = (self.hfield_ncol - 1) * global_res / 2
+        hy = (self.hfield_nrow - 1) * global_res / 2
         base = 0.1
         size = [hx, hy, self.global_range, base]
 
@@ -97,10 +98,10 @@ class Sim:
         add_hfield(
             spec,
             name="terrain",
-            nrow=hfield_nrow,
-            ncol=hfield_ncol,
+            nrow=self.hfield_nrow,
+            ncol=self.hfield_ncol,
             size=size,
-            initial_data=np.zeros(hfield_nrow * hfield_ncol),
+            initial_data=np.zeros(self.hfield_nrow * self.hfield_ncol),
         )
         self.model = spec.compile()
         self.data = mujoco.MjData(self.model)
@@ -205,7 +206,7 @@ class Sim:
 
 
 if __name__ == "__main__":
-    sim = Sim(xml_string, global_res=0.5)
+    sim = Sim(xml_string)
     horizon = int(0.5 / sim.dt)
     body_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_BODY, "ball")
 
