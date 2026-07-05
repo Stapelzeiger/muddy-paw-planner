@@ -28,10 +28,11 @@ def mppi_step(
     key: jax.Array,
     current_state: Any,
     nominal_trajectory: jax.Array,
-    goal_context: Any,
-    dynamics_fn: Callable[[Any, jax.Array], Any],
+    dynamics_fn: Callable[[Any, jax.Array, Any], Any],
+    dynamics_params: Any,
     cost_fn: Callable,
     terminal_cost_fn: Callable,
+    cost_context: Any,
     initial_cost_state: Any = None,
     noise_std: jax.Array = jnp.array([0.5]),
     noise_freq_exponent: float = 0.0,
@@ -46,17 +47,18 @@ def mppi_step(
     sequence forward with ``dynamics_fn``, and sums per-step costs from ``cost_fn``.
 
     Cost state ``initial_cost_state`` is passed through ``cost_fn`` and ``terminal_cost_fn``.
-    ``cost_fn(cost_state, dyn_state, action, goal_context) -> (next_cost_state, step_cost)``
-    ``terminal_cost_fn(cost_state, dyn_state, goal_context) -> terminal_cost``
+    ``cost_fn(cost_state, dyn_state, action, cost_context) -> (next_cost_state, step_cost)``
+    ``terminal_cost_fn(cost_state, dyn_state, cost_context) -> terminal_cost``
 
     Args:
         key: JAX PRNG key for sampling noise.
         current_state: Dynamic state at the start of the horizon.
         nominal_trajectory: ``(horizon, action_dim)`` nominal control sequence.
-        goal_context: User-defined context (e.g. goal) passed through to ``cost_fn``.
-        dynamics_fn: ``(state, action) -> next_state``.
+        dynamics_fn: ``(state, action, dynamics_params) -> next_state``.
+        dynamics_params: Parameters for the dynamics model.
         cost_fn: Stateful per-step cost; see above.
         terminal_cost_fn: Terminal cost function; see above.
+        cost_context: User-defined cost context (e.g. goal) passed to ``cost_fn``.
         initial_cost_state: Initial cost state passed through ``cost_fn``.
         noise_std: Per-action noise scale, broadcast over ``action_dim``.
         noise_freq_exponent: Power-law exponent β for coloured noise (0 = white).
@@ -94,9 +96,9 @@ def mppi_step(
     def rollout_single_trajectory(control_sequence):
         def step(carry, action):
             dyn_state, cost_state = carry
-            next_dyn_state = dynamics_fn(dyn_state, action)
+            next_dyn_state = dynamics_fn(dyn_state, action, dynamics_params)
             next_cost_state, step_cost = cost_fn(
-                cost_state, next_dyn_state, action, goal_context
+                cost_state, next_dyn_state, action, cost_context
             )
             return (next_dyn_state, next_cost_state), step_cost
 
@@ -104,7 +106,7 @@ def mppi_step(
         (final_state, cost_state), step_costs = jax.lax.scan(
             step, init_carry, control_sequence
         )
-        terminal_cost = terminal_cost_fn(cost_state, final_state, goal_context)
+        terminal_cost = terminal_cost_fn(cost_state, final_state, cost_context)
         return jnp.sum(step_costs) + terminal_cost
 
     rollout_all = jax.vmap(rollout_single_trajectory)
@@ -124,7 +126,7 @@ def mppi_step(
 
     def rollout_states(control_sequence):
         def step(carry_state, action):
-            next_state = dynamics_fn(carry_state, action)
+            next_state = dynamics_fn(carry_state, action, dynamics_params)
             return next_state, next_state
 
         _, state_history = jax.lax.scan(step, current_state, control_sequence)
@@ -162,14 +164,14 @@ if __name__ == "__main__":
 
         return jnp.array([next_x, next_y, next_theta])
 
-    def unicycle_cost_fn(cost_state, state, action, goal_context):
-        pos_error = jnp.sum((state[:2] - goal_context[:2]) ** 2)
-        theta_error = (state[2] - goal_context[2]) ** 2
+    def unicycle_cost_fn(cost_state, state, action, cost_context):
+        pos_error = jnp.sum((state[:2] - cost_context[:2]) ** 2)
+        theta_error = (state[2] - cost_context[2]) ** 2
         control_cost = 0.01 * jnp.sum(action**2)
         step_cost = pos_error + 0.1 * theta_error + control_cost
         return cost_state, step_cost
 
-    def unicycle_terminal_cost_fn(final_cost_state, final_state, goal_context):
+    def unicycle_terminal_cost_fn(final_cost_state, final_state, cost_context):
         return 0.0
 
     rng = jax.random.PRNGKey(42)
@@ -203,10 +205,11 @@ if __name__ == "__main__":
             step_key,
             state,
             nominal_traj,
-            target,
             unicycle_dynamics,
+            0.1,  # dynamics_params (dt)
             unicycle_cost_fn,
             unicycle_terminal_cost_fn,
+            target,
             top_k=30,
         )
         u = nominal_traj[0]
