@@ -1,3 +1,5 @@
 jax
 numpy
 matplotlib # for examples / demo visualizations
+mujoco # for simulation
+mujoco-mjx # used for ground truth dynamics rollouts in MPPI

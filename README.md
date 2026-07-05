@@ -11,3 +11,4 @@ It is written in JAX to support learning methods and GPU acceleration.
 - `gridmap.py` — Multi-layer grid map with nearest-neighbor and bilinear interpolation (supports x, y, heading)
 - `lattice_planner.py` — Lattice-based Dijkstra planner for computing cost-to-go maps used by MPPI
 - `cost.py` — Map-based navigation cost functions
+- `sim.py` — MuJoCo simulation environment
