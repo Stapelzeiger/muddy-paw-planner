@@ -30,25 +30,6 @@ def elevation(x, y):
     return np.cos(x) + np.sin(2 * y) + 0.1 * x - 100
 
 
-def add_hfield(spec, name, nrow, ncol, size, initial_data):
-    """Attach a height-field asset plus a mocap floor body/geom to the spec.
-
-    The floor body is mocap so the local terrain window can be repositioned and
-    re-sliced around the robot at runtime without going through the physics.
-    """
-    hfield = spec.add_hfield(name=name, nrow=nrow, ncol=ncol, size=size)
-    hfield.userdata = initial_data.flatten().astype(np.float32)
-
-    body = spec.worldbody.add_body(name="floor_body", mocap=True)
-    body.add_geom(
-        name="floor",
-        type=mujoco.mjtGeom.mjGEOM_HFIELD,
-        hfieldname=name,
-        rgba=[0.3, 0.5, 0.3, 1],
-    )
-    return body
-
-
 def add_checkerboard(spec, extent, z):
     """Add a visualization-only checkerboard plane spanning the full map, below the terrain."""
     tex = spec.add_texture(name="checkerboard")
@@ -83,51 +64,20 @@ class Sim:
         hfield_nrow=101,
         hfield_ncol=101,
     ):
-        self.global_extent = global_extent
-        self.global_res = global_res
+        mj_spec = mujoco.MjSpec.from_string(xml_string)
 
-        global_x = np.arange(-global_extent, global_extent, global_res)
-        global_y = np.arange(-global_extent, global_extent, global_res)
-        X, Y = np.meshgrid(global_x, global_y)
-        Z = elevation(X, Y)
-
-        # Metric heights shifted so the origin sits at z=0.
-        origin_idx = int(round(global_extent / global_res))
-        Z = Z - Z[origin_idx, origin_idx]
-        self.global_min = float(Z.min())
-        self.global_range = float(Z.max() - Z.min())
-        # Stored normalized to [0, 1] over the global range so a slice can be
-        # written straight into the hfield; max_height/geom-z recover metric z.
-        self.global_hmap = (Z - self.global_min) / self.global_range
-
-        # The local window cannot hold more samples than the global grid.
-        self.hfield_nrow = min(hfield_nrow, self.global_hmap.shape[0])
-        self.hfield_ncol = min(hfield_ncol, self.global_hmap.shape[1])
-        # Hfield half-extents aligned to the global grid spacing.
-        hx = (self.hfield_ncol - 1) * global_res / 2
-        hy = (self.hfield_nrow - 1) * global_res / 2
-        base = 0.1
-        size = [hx, hy, self.global_range, base]
-
-        spec = mujoco.MjSpec.from_string(xml_string)
-        add_checkerboard(spec, extent=global_extent, z=self.global_min)
-        add_hfield(
-            spec,
-            name="terrain",
-            nrow=self.hfield_nrow,
-            ncol=self.hfield_ncol,
-            size=size,
-            initial_data=np.zeros(self.hfield_nrow * self.hfield_ncol),
+        mj_spec = self._build_hfields(
+            mj_spec, global_extent, global_res, hfield_nrow, hfield_ncol
         )
-        self.model = spec.compile()
+        self.model = mj_spec.compile()
         self.data = mujoco.MjData(self.model)
         self.substeps = max(1, round(dt / self.model.opt.timestep))
 
-        self.hfield_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_HFIELD, "terrain"
-        )
         self.robot_body_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_BODY, robot_body_name
+        )
+        self.hfield_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_HFIELD, "terrain"
         )
         self.floor_mocap_id = self.model.body_mocapid[
             mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "floor_body")
@@ -135,14 +85,79 @@ class Sim:
         self.hfield_adr = self.model.hfield_adr[self.hfield_id]
 
         self.mjx_model = mjx.put_model(self.model)
-        self.update_local_terrain()
+        self._shfit_local_collision_terrain()
         self._mjx_state = mjx.make_data(self.mjx_model)
 
     @property
     def dt(self):
         return self.substeps * self.model.opt.timestep
 
-    def update_local_terrain(self):
+    def _build_hfields(self, mj_spec, extent, res, hfield_nrow, hfield_ncol):
+        self.global_extent = extent
+        self.global_res = res
+
+        global_x = np.arange(-extent, extent, res)
+        global_y = np.arange(-extent, extent, res)
+        X, Y = np.meshgrid(global_x, global_y)
+        Z = elevation(X, Y)
+
+        origin_idx = int(round(extent / res))
+        Z = Z - Z[origin_idx, origin_idx]
+        self.global_min = float(Z.min())
+        self.global_range = float(Z.max() - Z.min())
+        self.global_hmap = (Z - self.global_min) / self.global_range
+
+        self.hfield_nrow = min(hfield_nrow, self.global_hmap.shape[0])
+        self.hfield_ncol = min(hfield_ncol, self.global_hmap.shape[1])
+        base = 0.1
+        hx = (self.hfield_ncol - 1) * res / 2
+        hy = (self.hfield_nrow - 1) * res / 2
+
+        global_hx = (global_x[-1] - global_x[0]) / 2
+        global_hy = (global_y[-1] - global_y[0]) / 2
+        global_cx = (global_x[0] + global_x[-1]) / 2
+        global_cy = (global_y[0] + global_y[-1]) / 2
+
+        add_checkerboard(mj_spec, extent=extent, z=self.global_min)
+
+        nrow, ncol = self.global_hmap.shape
+        hfield = mj_spec.add_hfield(
+            name="terrain_global",
+            nrow=nrow,
+            ncol=ncol,
+            size=[global_hx, global_hy, self.global_range, base],
+        )
+        hfield.userdata = self.global_hmap.flatten().astype(np.float32)
+        mj_spec.worldbody.add_geom(
+            name="terrain_global",
+            type=mujoco.mjtGeom.mjGEOM_HFIELD,
+            hfieldname="terrain_global",
+            rgba=[0.5, 0.42, 0.32, 1],
+            pos=[global_cx, global_cy, self.global_min - 0.05],
+            contype=0,
+            conaffinity=0,
+        )
+
+        hfield = mj_spec.add_hfield(
+            name="terrain",
+            nrow=self.hfield_nrow,
+            ncol=self.hfield_ncol,
+            size=[hx, hy, self.global_range, base],
+        )
+        hfield.userdata = np.zeros(
+            self.hfield_nrow * self.hfield_ncol, dtype=np.float32
+        )
+        body = mj_spec.worldbody.add_body(name="floor_body", mocap=True)
+        body.add_geom(
+            name="floor",
+            type=mujoco.mjtGeom.mjGEOM_HFIELD,
+            hfieldname="terrain",
+            rgba=[0.3, 0.5, 0.3, 1],
+        )
+
+        return mj_spec
+
+    def _shfit_local_collision_terrain(self):
         """Slice the global heightmap around the robot and sync it into data and mjx."""
         robot_x, robot_y = self.data.xpos[self.robot_body_id][:2]
         extent = self.global_extent
@@ -193,7 +208,7 @@ class Sim:
         self.data.ctrl[:] = action
         for _ in range(self.substeps):
             mujoco.mj_step(self.model, self.data)
-        self.update_local_terrain()
+        self._shfit_local_collision_terrain()
 
     def get_mjx_model(self):
         return self.mjx_model
