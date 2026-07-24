@@ -1,3 +1,4 @@
+import functools
 import time
 
 import jax
@@ -6,6 +7,8 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 from mujoco import mjx
+
+import gridmap
 
 ball_model = """
 <mujoco>
@@ -27,7 +30,7 @@ ball_model = """
 
 
 def elevation(x, y):
-    return np.cos(x) + np.sin(2 * y) + 0.1 * x - 100
+    return (np.cos(x) + np.sin(2 * y) + 0.1 * x - 100) * 0.05
 
 
 def add_checkerboard(spec, extent, z):
@@ -204,6 +207,37 @@ class Sim:
             hfield_data=jnp.asarray(self.model.hfield_data),
         )
 
+    def render_local_map(self, eye_height=0.5):
+        """Raytrace a local elevation map around the robot using DDA.
+
+        Returns a GridMap with the same extent as the local hfield.  Rays
+        start at the robot position (+ eye_height in z) and travel to each
+        local map cell.  A cell is marked occluded if terrain blocks the ray
+        before it reaches the cell.
+
+        Layers:
+            elevation  – terrain height at visible cells, ``inf`` elsewhere
+            occlusion  – 0.0 = visible, 1.0 = occluded
+        """
+        robot_xy, robot_z = (
+            self.data.xpos[self.robot_body_id][:2],
+            self.data.xpos[self.robot_body_id][2],
+        )
+        robot_pos = jnp.append(
+            jnp.asarray(robot_xy, dtype=jnp.float32),
+            jnp.float32(robot_z + eye_height),
+        )
+        global_elev = jnp.asarray(
+            self.global_hmap * self.global_range + self.global_min
+        )
+        return _dda_raytrace(
+            robot_pos,
+            self.hfield_ncol,
+            self.global_res,
+            self.global_extent,  # half-width of the global heightfield
+            global_elev,
+        )
+
     def step(self, action):
         self.data.ctrl[:] = action
         for _ in range(self.substeps):
@@ -234,6 +268,118 @@ class Sim:
             mocap_quat=jnp.asarray(self.data.mocap_quat),
             time=self.data.time,
         )
+
+
+@functools.partial(
+    jax.jit, static_argnames=("map_size", "global_res", "global_half_width")
+)
+def _dda_raytrace(robot_pos, map_size, global_res, global_half_width, global_elev):
+    """JIT-compiled DDA raytrace over a heightfield.
+
+    Args:
+        robot_pos:        (3,) array [x, y, z] of the ray origin in world frame.
+        map_size:         number of cells per side of the square local output grid.
+        global_res:       cell size (m) of the global heightfield.
+        global_half_width: half-width (m) of the global heightfield.
+        global_elev:      (H, W) array of terrain elevations in world frame.
+    """
+    robot_x, robot_y, eye_z = robot_pos[0], robot_pos[1], robot_pos[2]
+    gw, gh = global_elev.shape
+
+    half = (map_size - 1) * global_res / 2
+    origin_x = robot_x - half
+    origin_y = robot_y - half
+
+    xs = origin_x + (jnp.arange(map_size) + 0.5) * global_res
+    ys = origin_y + (jnp.arange(map_size) + 0.5) * global_res
+    tx = jnp.broadcast_to(xs.reshape(1, map_size), (map_size, map_size))
+    ty = jnp.broadcast_to(ys.reshape(map_size, 1), (map_size, map_size))
+
+    gcol = jnp.round((tx + global_half_width) / global_res).astype(jnp.int32)
+    grow = jnp.round((ty + global_half_width) / global_res).astype(jnp.int32)
+    valid = (gcol >= 0) & (gcol < gw) & (grow >= 0) & (grow < gh)
+    gcol_clip = jnp.clip(gcol, 0, gw - 1)
+    grow_clip = jnp.clip(grow, 0, gh - 1)
+    tz = jnp.where(valid, global_elev[grow_clip, gcol_clip], jnp.nan)
+
+    dx = tx - robot_x
+    dy = ty - robot_y
+    dz = tz - eye_z
+
+    start_col = jnp.floor((robot_x + global_half_width) / global_res).astype(jnp.int32)
+    start_row = jnp.floor((robot_y + global_half_width) / global_res).astype(jnp.int32)
+
+    eps = 1e-10
+    step_x = jnp.where(dx > eps, 1, jnp.where(dx < -eps, -1, 0)).astype(jnp.int32)
+    step_y = jnp.where(dy > eps, 1, jnp.where(dy < -eps, -1, 0)).astype(jnp.int32)
+
+    t_delta_x = jnp.where(jnp.abs(dx) > eps, jnp.abs(global_res / dx), jnp.inf)
+    t_delta_y = jnp.where(jnp.abs(dy) > eps, jnp.abs(global_res / dy), jnp.inf)
+
+    next_x_pos = -global_half_width + (start_col + 1) * global_res
+    next_x_neg = -global_half_width + start_col * global_res
+    next_y_pos = -global_half_width + (start_row + 1) * global_res
+    next_y_neg = -global_half_width + start_row * global_res
+
+    t_max_x = jnp.where(
+        dx > eps,
+        (next_x_pos - robot_x) / dx,
+        jnp.where(dx < -eps, (next_x_neg - robot_x) / dx, jnp.inf),
+    )
+    t_max_y = jnp.where(
+        dy > eps,
+        (next_y_pos - robot_y) / dy,
+        jnp.where(dy < -eps, (next_y_neg - robot_y) / dy, jnp.inf),
+    )
+
+    col = jnp.full((map_size, map_size), start_col, dtype=jnp.int32)
+    row = jnp.full((map_size, map_size), start_row, dtype=jnp.int32)
+
+    occlusion = jnp.ones((map_size, map_size), dtype=jnp.float32)
+    active = valid
+
+    same_cell = active & (col == gcol) & (row == grow)
+    occlusion = jnp.where(same_cell, 0.0, occlusion)
+    active = active & ~same_cell
+
+    def body_fn(_, carry):
+        col, row, t_max_x, t_max_y, occlusion, active = carry
+
+        step_x_mask = active & (t_max_x < t_max_y)
+        t = jnp.where(step_x_mask, t_max_x, t_max_y)
+
+        arrived = active & (t >= 1.0)
+        occlusion = jnp.where(arrived, 0.0, occlusion)
+
+        cc = jnp.clip(col, 0, gw - 1)
+        cr = jnp.clip(row, 0, gh - 1)
+        ray_z = eye_z + t * dz
+        hit = active & (ray_z < global_elev[cr, cc])
+
+        oob = active & ((col < 0) | (col >= gw) | (row < 0) | (row >= gh))
+
+        terminated = arrived | hit | oob
+        active = active & ~terminated
+
+        col = jnp.where(active & step_x_mask, col + step_x, col)
+        row = jnp.where(active & ~step_x_mask, row + step_y, row)
+        t_max_x = jnp.where(active & step_x_mask, t_max_x + t_delta_x, t_max_x)
+        t_max_y = jnp.where(active & ~step_x_mask, t_max_y + t_delta_y, t_max_y)
+
+        return col, row, t_max_x, t_max_y, occlusion, active
+
+    init = (col, row, t_max_x, t_max_y, occlusion, active)
+    col, row, t_max_x, t_max_y, occlusion, active = jax.lax.fori_loop(
+        0, map_size * 2, body_fn, init
+    )
+
+    elevation = jnp.where(occlusion < 0.5, tz, jnp.nan)
+
+    return gridmap.GridMap(
+        origin=jnp.array([origin_x, origin_y]),
+        resolution=float(global_res),
+        layers={"elevation": elevation, "occlusion": occlusion},
+    )
 
 
 if __name__ == "__main__":

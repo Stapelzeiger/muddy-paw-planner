@@ -75,7 +75,6 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
 
-    key = jax.random.PRNGKey(0)
     exponents = [0, 1, 2, 3, 4, 10]
     labels = ["White (β=0)", "Pink (β=1)", "Brown (β=2)", "β=3", "β=4", "β=10"]
     size = (8, 1024)
@@ -86,6 +85,7 @@ if __name__ == "__main__":
         hspace=0.15, wspace=0.08, bottom=0.08, top=0.92, left=0.08, right=0.97
     )
     for row, (exp, label) in enumerate(zip(exponents, labels)):
+        key = jax.random.PRNGKey(0)
         y = np.asarray(colored_noise(key, exponent=exp, size=size))
         integral = np.cumsum(y, axis=-1)
 
